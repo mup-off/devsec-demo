@@ -132,6 +132,30 @@ LOGIN_REDIRECT_URL = '/auth/'
 LOGOUT_REDIRECT_URL = '/auth/login/'
 LOGIN_URL = '/auth/login/'
 
+# ── Cache ──────────────────────────────────────────────────────────────────
+# Development default: in-process LocMemCache (no external server needed).
+# For production set DJANGO_CACHE_BACKEND (e.g. django_redis.cache.RedisCache)
+# and DJANGO_CACHE_LOCATION (e.g. redis://127.0.0.1:6379/1).
+# Multi-process or multi-server deployments MUST use a shared backend
+# (Redis / Memcached) so that lockout state is visible across all workers.
+CACHES = {
+    'default': {
+        'BACKEND': os.environ.get(
+            'DJANGO_CACHE_BACKEND',
+            'django.core.cache.backends.locmem.LocMemCache',
+        ),
+        'LOCATION': os.environ.get('DJANGO_CACHE_LOCATION', 'mf-auth-cache'),
+    }
+}
+
+# ── Login brute-force protection ──────────────────────────────────────────
+# Maximum consecutive failed login attempts before an account is locked.
+LOGIN_MAX_ATTEMPTS = int(os.environ.get('LOGIN_MAX_ATTEMPTS', 5))
+# Seconds the account stays locked after reaching the threshold.
+LOGIN_LOCKOUT_DURATION = int(os.environ.get('LOGIN_LOCKOUT_DURATION', 900))   # 15 min
+# Rolling window (seconds) in which failures are counted.
+LOGIN_ATTEMPT_WINDOW = int(os.environ.get('LOGIN_ATTEMPT_WINDOW', 900))       # 15 min
+
 # ── Email ──────────────────────────────────────────────────────────────────
 # Development default: print emails to the console (no SMTP server needed).
 # In production set DJANGO_EMAIL_BACKEND to an SMTP or transactional backend

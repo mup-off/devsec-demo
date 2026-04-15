@@ -8,6 +8,13 @@ from django.urls import reverse_lazy
 from django.views.generic import CreateView, ListView, TemplateView, UpdateView
 
 from .forms import ProfileUpdateForm, RegistrationForm
+from .login_protection import (
+    LOCKOUT_DURATION,
+    MAX_ATTEMPTS,
+    is_locked_out,
+    record_failure,
+    reset_failures,
+)
 from .models import Profile
 from .rbac import (
     AdminRequiredMixin,
@@ -60,23 +67,101 @@ class RegisterView(CreateView):
 
 class UserLoginView(auth_views.LoginView):
     """
-    Authenticates users via Django's built-in LoginView.
-    Redirects already-authenticated users away from the login page.
+    Authenticates users via Django's built-in LoginView with cache-based
+    brute-force protection.
+
+    Protection flow
+    ───────────────
+    1. POST arrives → check lockout BEFORE form validation (post()).
+       If locked: render empty form with lockout flash message; stop.
+    2. Form valid   → reset_failures(); show welcome message; redirect.
+    3. Form invalid → record_failure(); show contextual message:
+         • Failure 1 … (MAX-2): generic "invalid credentials" error.
+         • Failure MAX-1:        warning — one attempt before lockout.
+         • Failure MAX:          lockout activated; render empty form
+                                 with lockout message (no form errors).
+         • Subsequent POSTs:     caught by post() before reaching form.
+
+    Anti-enumeration
+    ────────────────
+    Counters are tracked by normalized username regardless of whether the
+    account exists.  The lockout message is identical for real and
+    fictitious usernames, so an attacker observing HTTP responses cannot
+    determine whether an account exists from lockout behaviour alone.
     """
     template_name = 'mupenz_fulgence/registration/login.html'
     redirect_authenticated_user = True
 
+    # ── Pre-validation lockout check ──────────────────────────────────────────
+
+    def post(self, request, *args, **kwargs):
+        """Block locked accounts before the form is even validated."""
+        username = request.POST.get('username', '').strip()
+        if is_locked_out(username):
+            messages.error(
+                request,
+                f'Too many failed login attempts. '
+                f'Please wait {LOCKOUT_DURATION // 60} minutes before trying again.',
+            )
+            # Render an unbound (empty) form — do not echo the submitted data
+            return self.render_to_response(
+                self.get_context_data(form=self.get_form_class()())
+            )
+        return super().post(request, *args, **kwargs)
+
+    # ── Successful authentication ─────────────────────────────────────────────
+
     def form_valid(self, form):
+        """Clear the failure counter on every successful login."""
         user = form.get_user()
+        reset_failures(user.username)
         name = user.get_short_name() or user.username
         messages.success(self.request, f'Welcome back, {name}!')
         return super().form_valid(form)
 
+    # ── Failed authentication ─────────────────────────────────────────────────
+
     def form_invalid(self, form):
-        messages.error(
-            self.request,
-            'Invalid username or password. Please try again.',
-        )
+        """Record the failure and show an appropriate message."""
+        username = self.request.POST.get('username', '').strip()
+
+        if not username:
+            messages.error(
+                self.request,
+                'Invalid username or password. Please try again.',
+            )
+            return super().form_invalid(form)
+
+        count = record_failure(username)
+        remaining = MAX_ATTEMPTS - count  # failures still allowed after this one
+
+        if count >= MAX_ATTEMPTS:
+            # This attempt triggered the lockout.
+            # Render a clean page (no form errors) so the lockout message is
+            # unambiguous — showing form errors alongside would be confusing.
+            messages.error(
+                self.request,
+                f'Too many failed login attempts. '
+                f'Please wait {LOCKOUT_DURATION // 60} minutes before trying again.',
+            )
+            return self.render_to_response(
+                self.get_context_data(form=self.get_form_class()())
+            )
+
+        if remaining == 1:
+            # One attempt left — warn the user so they consider using
+            # "Forgot password?" rather than risk being locked out.
+            messages.warning(
+                self.request,
+                'Invalid username or password. '
+                'One more failed attempt will temporarily lock this account.',
+            )
+        else:
+            messages.error(
+                self.request,
+                'Invalid username or password. Please try again.',
+            )
+
         return super().form_invalid(form)
 
 

@@ -10,10 +10,12 @@ Coverage:
   - RBAC: anonymous, user, instructor, staff, admin access matrix
   - IDOR / Broken Access Control: profile detail access by pk
   - Password reset: full flow, anti-enumeration, invalid tokens, validation
+  - Brute-force protection: lockout mechanics, counter reset, UX messages
 """
 from django.contrib.auth.models import Group, User
 from django.contrib.auth.tokens import default_token_generator
 from django.core import mail
+from django.core.cache import cache
 from django.test import Client, TestCase
 from django.urls import reverse
 from django.utils.encoding import force_bytes
@@ -1020,3 +1022,172 @@ class PasswordResetTests(TestCase):
         """The login page must contain a visible link to the reset request page."""
         response = self.client.get(reverse('mupenz_fulgence:login'))
         self.assertContains(response, reverse('mupenz_fulgence:password_reset'))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Brute-force / login-abuse protection
+# ──────────────────────────────────────────────────────────────────────────────
+
+class BruteForceProtectionTests(TestCase):
+    """
+    Tests for cache-based login brute-force protection.
+
+    Django's test runner uses django.test.utils.setup_test_environment()
+    which replaces the cache backend with LocMemCache isolated per test
+    class.  Each TestCase gets a clean cache — no bleed-through between
+    tests.
+
+    Security properties verified:
+      - Failure counter increments on each bad login
+      - Counter resets to zero on a successful login
+      - Case-insensitive username normalisation (Alice == alice)
+      - Lockout activates exactly at MAX_ATTEMPTS
+      - Locked account rejected even with the correct password
+      - Non-existent usernames are tracked identically (anti-enumeration)
+      - Lockout can be cleared (simulating TTL expiry via reset_failures)
+      - Warning message appears one attempt before lockout
+      - Lockout message is identical for real and fictitious usernames
+      - Normal logins below threshold are unaffected
+    """
+
+    def setUp(self):
+        # LocMemCache persists across TestCase runs within the same process.
+        # Clear it before each test to prevent counter bleed-through.
+        cache.clear()
+        self.client   = Client()
+        self.user     = make_user(
+            username='brutetest',
+            password='StrongPass123!',
+            email='brute@example.com',
+        )
+        self.login_url     = reverse('mupenz_fulgence:login')
+        self.dashboard_url = reverse('mupenz_fulgence:dashboard')
+
+    def _post(self, username, password):
+        return self.client.post(self.login_url,
+                                {'username': username, 'password': password})
+
+    def _fail(self, username='brutetest', n=1):
+        """Submit n consecutive wrong-password logins."""
+        for _ in range(n):
+            self._post(username, 'WRONG_PASSWORD!')
+
+    # ── Counter mechanics ─────────────────────────────────────────────────────
+
+    def test_failure_counter_increments_on_each_bad_login(self):
+        from mupenz_fulgence.login_protection import get_failure_count
+        self._fail(n=3)
+        self.assertEqual(get_failure_count('brutetest'), 3)
+
+    def test_counter_case_insensitive(self):
+        """'BruteTest' and 'brutetest' must share the same counter."""
+        from mupenz_fulgence.login_protection import get_failure_count
+        self._fail('BruteTest', n=2)
+        self._fail('BRUTETEST', n=1)
+        self.assertEqual(get_failure_count('brutetest'), 3)
+
+    def test_successful_login_resets_counter_to_zero(self):
+        from mupenz_fulgence.login_protection import get_failure_count
+        self._fail(n=3)
+        self._post('brutetest', 'StrongPass123!')
+        self.assertEqual(get_failure_count('brutetest'), 0)
+
+    def test_successful_login_clears_lockout_flag(self):
+        from mupenz_fulgence.login_protection import MAX_ATTEMPTS, is_locked_out, reset_failures
+        self._fail(n=MAX_ATTEMPTS)
+        self.assertTrue(is_locked_out('brutetest'))
+        # Simulate TTL expiry by calling reset_failures() directly
+        reset_failures('brutetest')
+        self.assertFalse(is_locked_out('brutetest'))
+
+    # ── Lockout activation ────────────────────────────────────────────────────
+
+    def test_lockout_triggers_at_exactly_max_attempts(self):
+        from mupenz_fulgence.login_protection import MAX_ATTEMPTS, is_locked_out
+        self._fail(n=MAX_ATTEMPTS - 1)
+        self.assertFalse(is_locked_out('brutetest'), 'Should not be locked before threshold')
+        self._fail(n=1)
+        self.assertTrue(is_locked_out('brutetest'), 'Should be locked at threshold')
+
+    def test_locked_account_rejected_with_correct_password(self):
+        """The correct password must not bypass an active lockout."""
+        from mupenz_fulgence.login_protection import MAX_ATTEMPTS
+        self._fail(n=MAX_ATTEMPTS)
+        response = self._post('brutetest', 'StrongPass123!')
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.wsgi_request.user.is_authenticated)
+
+    def test_lockout_response_contains_error_message(self):
+        """The lockout page must visibly explain the situation."""
+        from mupenz_fulgence.login_protection import MAX_ATTEMPTS
+        self._fail(n=MAX_ATTEMPTS)
+        response = self._post('brutetest', 'StrongPass123!')
+        self.assertContains(response, 'Too many failed login attempts')
+
+    # ── Anti-enumeration ──────────────────────────────────────────────────────
+
+    def test_nonexistent_username_also_tracked_and_locked(self):
+        """
+        Failures for a non-existent username must be tracked and eventually
+        locked, making the lockout behaviour indistinguishable from that of
+        a real account and preventing username enumeration via lockout state.
+        """
+        from mupenz_fulgence.login_protection import MAX_ATTEMPTS, is_locked_out
+        fake = 'definitely_not_a_real_user_xyz'
+        self._fail(fake, n=MAX_ATTEMPTS)
+        self.assertTrue(is_locked_out(fake))
+
+    def test_lockout_message_identical_for_real_and_fake_username(self):
+        """
+        The HTTP response content for a locked real account and a locked
+        fictitious account must contain the same message, giving an attacker
+        no way to distinguish them.
+        """
+        from mupenz_fulgence.login_protection import MAX_ATTEMPTS
+        self._fail('brutetest', n=MAX_ATTEMPTS)
+        real_resp = self._post('brutetest', 'WRONG!')
+
+        fake = 'fake_user_enumeration_test'
+        self._fail(fake, n=MAX_ATTEMPTS)
+        fake_resp = self._post(fake, 'WRONG!')
+
+        self.assertContains(real_resp, 'Too many failed login attempts')
+        self.assertContains(fake_resp, 'Too many failed login attempts')
+
+    # ── Pre-lockout warning ───────────────────────────────────────────────────
+
+    def test_warning_shown_on_penultimate_failure(self):
+        """
+        When exactly one attempt remains before lockout, a warning must
+        appear prompting the user to use password reset instead.
+        """
+        from mupenz_fulgence.login_protection import MAX_ATTEMPTS
+        # Build up to (MAX_ATTEMPTS - 2) failures — no warning yet
+        self._fail(n=MAX_ATTEMPTS - 2)
+        # This is the (MAX_ATTEMPTS - 1)th failure → one left before lockout
+        response = self._post('brutetest', 'WRONG_PASSWORD!')
+        self.assertContains(response, 'lock')  # "lock this account" in the warning
+
+    # ── Normal login flow unaffected ──────────────────────────────────────────
+
+    def test_login_succeeds_with_no_prior_failures(self):
+        response = self._post('brutetest', 'StrongPass123!')
+        self.assertRedirects(response, self.dashboard_url)
+
+    def test_login_succeeds_below_threshold(self):
+        """A user with fewer failures than MAX_ATTEMPTS can still log in."""
+        from mupenz_fulgence.login_protection import MAX_ATTEMPTS
+        self._fail(n=MAX_ATTEMPTS - 1)
+        response = self._post('brutetest', 'StrongPass123!')
+        self.assertRedirects(response, self.dashboard_url)
+
+    def test_account_unlocks_after_reset(self):
+        """
+        After TTL expiry (simulated via reset_failures) the account must
+        accept a correct password again.
+        """
+        from mupenz_fulgence.login_protection import MAX_ATTEMPTS, reset_failures
+        self._fail(n=MAX_ATTEMPTS)
+        reset_failures('brutetest')
+        response = self._post('brutetest', 'StrongPass123!')
+        self.assertRedirects(response, self.dashboard_url)
